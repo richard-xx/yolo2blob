@@ -1,16 +1,49 @@
 # coding=utf-8
 import json
-import torch
+from pathlib import Path
+from zipfile import ZIP_LZMA, ZipFile
+
+import blobconverter
 import onnx
 import onnxsim
-import subprocess
-import blobconverter
-from zipfile import ZipFile, ZIP_LZMA
-from pathlib import Path
+import torch
+
+import docker
+
+# client = docker.from_env()
+# image = client.images.pull("openvino/ubuntu20_dev", tag="2022.1.0")
+# docker_output = client.containers.run(
+#     image=image.tags[0],
+#     command="echo 'MYRIAD_ENABLE_MX_BOOT ON' | tee /tmp/myriad.conf "
+#     + "&& /opt/intel/openvino/tools/compile_tool/compile_tool -m {} -ip {} "
+#     + "-VPU_NUMBER_OF_SHAVES {} -VPU_NUMBER_OF_CMX_SLICES {} -d MYRIAD -c /tmp/myriad.conf",
+#     remove=True,
+#     volumes=[
+#         ":/io",
+#     ],
+#     working_dir="/io",
+# )
+ov_dict = {
+    "2021.2": "2021.2",
+    "2021.3": "2021.3.2",
+    "2021.4": "2021.4.3",
+    "2022.1": "2022.1.0",
+}
 
 
 class Exporter:
-    def __init__(self, conv_path, weights_filename, imgsz, version):
+    def __init__(
+        self,
+        conv_path,
+        weights_filename,
+        imgsz=640,
+        version="v5",
+        shaves=6,
+        openvino_version="2202.1",
+        data_type="U8",
+        convert="network",
+        **kwargs,
+    ):
 
         # set up variables
         self.conv_path = conv_path
@@ -18,20 +51,23 @@ class Exporter:
         self.imgsz = imgsz
         self.model_name = weights_filename.split(".")[0]  # "result"
         self.version = version
+        self.shaves = shaves
+        self.openvino_version = openvino_version
+        self.data_type = data_type
 
         # set up file paths
         self.f_onnx = None
         self.f_simplified = None
-        self.f_bin = None
-        self.f_xml = None
-        self.f_mapping = None
+        # self.f_bin = None
+        # self.f_xml = None
+        # self.f_mapping = None
         self.f_blob = None
         self.f_json = None
         self.f_zip = None
 
     def get_onnx(self):
         # export onnx model
-        self.f_onnx = (self.conv_path / f"{self.model_name}.onnx").resolve()
+        self.f_onnx = (self.conv_path / f"{self.model_name}-origin.onnx").resolve()
         im = torch.zeros(
             1, 3, *self.imgsz[::-1]
         )  # .to(device)  # image size(1,3,320,192) BCHW iDetection
@@ -40,7 +76,7 @@ class Exporter:
             im,
             self.f_onnx,
             verbose=False,
-            opset_version=12,
+            opset_version=17,
             training=torch.onnx.TrainingMode.EVAL,
             do_constant_folding=True,
             input_names=["images"],
@@ -48,35 +84,37 @@ class Exporter:
             dynamic_axes=None,
         )
 
-        # check if the arhcitecture is correct
+        # check if the architecture is correct
         model_onnx = onnx.load(self.f_onnx)  # load onnx model
         onnx.checker.check_model(model_onnx)  # check onnx model
 
-        # simplify the moodel
+        # simplify the model
         return onnxsim.simplify(model_onnx)
 
     def export_blob(self):
-        if self.f_simplified is None:
-            self.export_onnx()
 
         output_list = [
-            f"output{i+1}_yolo{self.version}" for i in range(self.num_branches)
+            f"output{i + 1}_yolo{self.version}" for i in range(self.num_branches)
         ]
         output_list = ",".join(output_list)
 
+        if self.f_simplified is None:
+            self.export_onnx()
         # export blob from generate onnx
         blob_path = blobconverter.from_onnx(
             model=str(self.f_simplified.resolve()),  # as_posix(),
             data_type="FP16",
-            shaves=6,
-            version="2021.4",
+            shaves=self.shaves,
+            version=self.openvino_version,
             use_cache=False,
             output_dir=self.conv_path.resolve(),
             optimizer_params=[
                 "--scale=255",
                 "--reverse_input_channel",
                 f"--output={output_list}",
+                "--use_new_frontend" if self.openvino_version >= "2022.1" else "",
             ],
+            compile_params=[f"-ip {self.data_type}"],
             download_ir=True,
         )
 
@@ -119,7 +157,9 @@ class Exporter:
 
         return self.f_json
 
-    def make_zip(self):
+    def make_zip(
+        self,
+    ):
         # create a ZIP folder
         if self.f_simplified is None:
             self.export_onnx()
@@ -147,8 +187,8 @@ class Exporter:
                 self.f_simplified.with_suffix(".blob").name,
                 self.conv_path.resolve(),
             )
-            zip_obj.write(self.f_simplified, self.f_simplified.name)
-            zip_obj.write(self.f_json, self.f_json.name)
+            # zip_obj.write(self.f_simplified, self.f_simplified.name)
+            # zip_obj.write(self.f_json, self.f_json.name)
 
         self.f_zip = f_zip
         return f_zip

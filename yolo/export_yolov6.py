@@ -1,21 +1,21 @@
 # coding=utf-8
 
-import sys
-
-sys.path.append("./yolo/YOLOv6")
-
+import blobconverter
+import onnx
+import onnxsim
 import torch
 from yolov6.layers.common import RepVGGBlock
+from yolov6.models.efficientrep import (
+    CSPBepBackbone,
+    CSPBepBackbone_P6,
+    EfficientRep,
+    EfficientRep6,
+)
 from yolov6.utils.checkpoint import load_checkpoint
-import onnx
-from exporter import Exporter
 
-import numpy as np
-import onnxsim
-import subprocess
-
-from yolo.detect_head import DetectV2, DetectV1
-import blobconverter
+from yolo.backbones import YoloV6BackBone
+from yolo.detect_head import DetectV6R1, DetectV6R2
+from yolo.exporter import Exporter
 
 DIR_TMP = "./tmp"
 R1_VERSION = 1
@@ -23,8 +23,8 @@ R2_VERSION = 2
 
 
 class YoloV6Exporter(Exporter):
-    def __init__(self, conv_path, weights_filename, imgsz, version):
-        super().__init__(conv_path, weights_filename, imgsz, version)
+    def __init__(self, conv_path, weights_filename, **kwargs):
+        super().__init__(conv_path, weights_filename, **kwargs)
         self.load_model()
 
     def load_model(self):
@@ -42,12 +42,24 @@ class YoloV6Exporter(Exporter):
             if isinstance(layer, RepVGGBlock):
                 layer.switch_to_deploy()
 
+        for n, module in model.named_children():
+            if isinstance(module, EfficientRep) or isinstance(module, CSPBepBackbone):
+                setattr(model, n, YoloV6BackBone(module))
+            elif isinstance(module, EfficientRep6):
+                setattr(model, n, YoloV6BackBone(module, uses_6_erblock=True))
+            elif isinstance(module, CSPBepBackbone_P6):
+                setattr(
+                    model,
+                    n,
+                    YoloV6BackBone(module, uses_fuse_P2=False, uses_6_erblock=True),
+                )
+
         if not hasattr(model.detect, "obj_preds"):
             self.selected_release = R2_VERSION
-            model.detect = DetectV2(model.detect)
+            model.detect = DetectV6R2(model.detect)
         else:
             self.selected_release = R1_VERSION
-            model.detect = DetectV1(model.detect)
+            model.detect = DetectV6R1(model.detect)
 
         self.num_branches = len(model.detect.grid)
 
@@ -68,7 +80,7 @@ class YoloV6Exporter(Exporter):
 
     def get_onnx_r2(self):
         # export onnx model
-        self.f_onnx = (self.conv_path / f"{self.model_name}.onnx").resolve()
+        self.f_onnx = (self.conv_path / f"{self.model_name}-origin.onnx").resolve()
         im = torch.zeros(
             1, 3, *self.imgsz[::-1]
         )  # .to(device)  # image size(1,3,320,192) BCHW iDetection
@@ -77,11 +89,13 @@ class YoloV6Exporter(Exporter):
             im,
             self.f_onnx,
             verbose=False,
-            opset_version=12,
+            opset_version=17,
             training=torch.onnx.TrainingMode.EVAL,
             do_constant_folding=True,
             input_names=["images"],
-            output_names=["output1_yolov6r2", "output2_yolov6r2", "output3_yolov6r2"],
+            output_names=[
+                f"output{i+1}_yolo{self.version}r2" for i in range(self.num_branches)
+            ],
             dynamic_axes=None,
         )
 
@@ -112,9 +126,7 @@ class YoloV6Exporter(Exporter):
         onnx.checker.check_model(onnx_model)  # check onnx model
 
         # save the simplified model
-        self.f_simplified = (
-            self.conv_path / f"{self.model_name}-simplified.onnx"
-        ).resolve()
+        self.f_simplified = (self.conv_path / f"{self.model_name}.onnx").resolve()
         onnx.save(onnx_model, self.f_simplified)
         return self.f_simplified
 
@@ -136,15 +148,17 @@ class YoloV6Exporter(Exporter):
         blob_path = blobconverter.from_onnx(
             model=str(self.f_simplified.resolve()),  # as_posix(),
             data_type="FP16",
-            shaves=6,
-            version="2021.4",
+            shaves=self.shaves,
+            version=self.openvino_version,
             use_cache=False,
             output_dir=self.conv_path.resolve(),
             optimizer_params=[
                 "--scale=255",
                 "--reverse_input_channel",
                 f"--output={output_list}",
+                "--use_new_frontend" if self.openvino_version >= "2022.1" else "",
             ],
+            compile_params=[f"-ip {self.data_type}"],
             download_ir=True,
         )
 

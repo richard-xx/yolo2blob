@@ -1,30 +1,36 @@
 # coding=utf-8
+import sys
+
+import onnxsim
+
+from yolo.detect_head import DetectV5
+
+sys.path.append("./yolo/yolov5lite")
+
 import onnx
 import torch
 import torch.nn as nn
-from yolov7.models.common import Conv
-from yolov7.models.experimental import attempt_load
-from yolov7.models.yolo import Detect
-from yolov7.utils.activations import SiLU
+from yolo.yolov5lite.models.common import Conv
+from yolo.yolov5lite.models.experimental import attempt_load
+from yolo.yolov5lite.models.yolo import Detect
+from yolo.yolov5lite.utils.activations import Hardswish, SiLU
 
 from yolo.exporter import Exporter
 
 DIR_TMP = "./tmp"
 
 
-class YoloV7Exporter(Exporter):
+class YoloV5LiteExporter(Exporter):
     def __init__(self, conv_path, weights_filename, **kwargs):
         super().__init__(conv_path, weights_filename, **kwargs)
-
         self.load_model()
 
     def load_model(self):
-
         # code based on export.py from YoloV5 repository
         # load the model
         model = attempt_load(
             self.weights_path.resolve(), map_location=torch.device("cpu")
-        )
+        )  # load FP32 model
 
         # check num classes and labels
         assert model.nc == len(
@@ -43,42 +49,57 @@ class YoloV7Exporter(Exporter):
         if len(self.imgsz) != 2:
             raise ValueError(f"Image size must be of length 1 or 2.")
 
-        model.eval()
         inplace = True
 
+        model.eval()
         for k, m in model.named_modules():
             if isinstance(m, Conv):  # assign export-friendly activations
+                m._non_persistent_buffers_set = set()  # torch 1.6.0 compatibility
+                if isinstance(m.act, nn.Hardswish):
+                    m.act = Hardswish()
                 if isinstance(m.act, nn.SiLU):
                     m.act = SiLU()
-            # elif isinstance(m, Detect):
-            #     m.forward = m.forward_export  # assign custom forward (optional)
+            elif isinstance(m, nn.Upsample):
+                m.recompute_scale_factor = None  # torch 1.11.0 compatibility
+
+        # if isinstance(model.model[-1], Detect):
+        model.model[-1] = DetectV5(model.model[-1])
 
         self.model = model
 
-        m = model.module.model[-1] if hasattr(model, "module") else model.model[-1]
+        m = model.model[-1]
         self.num_branches = len(m.anchor_grid)
+
+    def get_onnx(self):
+        # export onnx model
+        self.f_onnx = (self.conv_path / f"{self.model_name}-origin.onnx").resolve()
+        im = torch.zeros(
+            1, 3, *self.imgsz[::-1]
+        )  # .to(device)  # image size(1,3,320,192) BCHW iDetection
+        torch.onnx.export(
+            self.model,
+            im,
+            self.f_onnx,
+            verbose=False,
+            opset_version=17,
+            training=torch.onnx.TrainingMode.EVAL,
+            do_constant_folding=True,
+            input_names=["images"],
+            output_names=[
+                f"output{i+1}_yolo{self.version}" for i in range(self.num_branches)
+            ],
+            dynamic_axes=None,
+        )
+
+        # check if the arhcitecture is correct
+        model_onnx = onnx.load(self.f_onnx)  # load onnx model
+        onnx.checker.check_model(model_onnx)  # check onnx model
+        # simplify the moodel
+        return onnxsim.simplify(model_onnx)
 
     def export_onnx(self):
         onnx_model, check = self.get_onnx()
         assert check, "assert check failed"
-
-        # add named sigmoids for prunning in OpenVINO
-        conv_indices = []
-        for i, n in enumerate(onnx_model.graph.node):
-            if "Conv" in n.name:
-                conv_indices.append(i)
-
-        inputs = conv_indices[-self.num_branches :]
-
-        for i, inp in enumerate(inputs):
-            sigmoid = onnx.helper.make_node(
-                "Sigmoid",
-                inputs=[onnx_model.graph.node[inp].output[0]],
-                outputs=[f"output{i+1}_yolov7"],
-            )
-            onnx_model.graph.node.append(sigmoid)
-
-        onnx.checker.check_model(onnx_model)  # check onnx model
 
         # save the simplified model
         self.f_simplified = (self.conv_path / f"{self.model_name}.onnx").resolve()

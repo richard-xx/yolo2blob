@@ -1,24 +1,20 @@
 # coding=utf-8
-import sys
-
-sys.path.append("./yolo/yolov5")
+import onnx
 import torch
-
-from yolov5.models.experimental import attempt_load
+import torch.nn as nn
 from yolov5.models.common import Conv
+from yolov5.models.experimental import attempt_load
 from yolov5.models.yolo import Detect
 from yolov5.utils.activations import SiLU
 
-import torch.nn as nn
-import onnx
-from exporter import Exporter
+from yolo.exporter import Exporter
 
 DIR_TMP = "./tmp"
 
 
 class YoloV5Exporter(Exporter):
-    def __init__(self, conv_path, weights_filename, imgsz, version):
-        super().__init__(conv_path, weights_filename, imgsz, version)
+    def __init__(self, conv_path, weights_filename, **kwargs):
+        super().__init__(conv_path, weights_filename, **kwargs)
         self.load_model()
 
     def load_model(self):
@@ -87,9 +83,7 @@ class YoloV5Exporter(Exporter):
         onnx.checker.check_model(onnx_model)  # check onnx model
 
         # save the simplified model
-        self.f_simplified = (
-            self.conv_path / f"{self.model_name}-simplified.onnx"
-        ).resolve()
+        self.f_simplified = (self.conv_path / f"{self.model_name}.onnx").resolve()
         onnx.save(onnx_model, self.f_simplified)
         return self.f_simplified
 
